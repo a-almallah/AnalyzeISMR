@@ -6,10 +6,9 @@ import os
 
 def parse_svid(svid_str):
     """Parses SVID string which can be a single ID, a comma-separated list, or a range."""
-    svids = set()
     if not svid_str:
         return None
-    
+    svids = set()
     parts = svid_str.split(',')
     for part in parts:
         if '-' in part:
@@ -25,6 +24,143 @@ def parse_svid(svid_str):
                 print(f"Warning: Invalid SVID format '{part}'. Skipping.")
     return list(svids)
 
+def load_and_filter(args):
+    """Loads ISMR data, applies filters, and handles missing columns."""
+    header = [
+        "WN", "TOW", "SVID", "RxState", "Azimuth", "Elevation", "Sig1_CN0", "Sig1_S4", "Sig1_S4_corr", 
+        "Sig1_Phi01", "Sig1_Phi03", "Sig1_Phi10", "Sig1_Phi30", "Sig1_Phi60", "Sig1_AvgCCD", "Sig1_SigmaCCD", 
+        "TEC_45", "dTEC_60_45", "TEC_30", "dTEC_45_30", "TEC_15", "dTEC_30_15", "TEC_0", "dTEC_15_0", 
+        "Sig1_LockTime", "sbf2ismr_version", "Sig2_LockTime_TEC", "Sig2_CN0_TEC", "Sig1_SI", "Sig1_SI_num", 
+        "Sig1_p", "Sig2_CN0", "Sig2_S4", "Sig2_S4_corr", "Sig2_Phi01", "Sig2_Phi03", "Sig2_Phi10", 
+        "Sig2_Phi30", "Sig2_Phi60", "Sig2_AvgCCD", "Sig2_SigmaCCD", "Sig2_LockTime", "Sig2_SI", 
+        "Sig2_SI_num", "Sig2_p", "Sig3_CN0", "Sig3_S4", "Sig3_S4_corr", "Sig3_Phi01", "Sig3_Phi03", 
+        "Sig3_Phi10", "Sig3_Phi30", "Sig3_Phi60", "Sig3_AvgCCD", "Sig3_SigmaCCD", "Sig3_LockTime", 
+        "Sig3_SI", "Sig3_SI_num", "Sig3_p", "Sig1_T", "Sig2_T", "Sig3_T"
+    ]
+
+    try:
+        df = pd.read_csv(args.input, names=header, skipinitialspace=True)
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        sys.exit(1)
+
+    required_cols = ["TOW", "SVID", "Elevation", args.y_col] + args.x_cols
+    lock_time_cols = [c for c in header if "LockTime" in c]
+    required_cols.extend(lock_time_cols)
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        user_specified = set(args.x_cols + [args.y_col, "TOW", "SVID", "Elevation"])
+        missing_user = [c for c in missing if c in user_specified]
+        if missing_user:
+            print(f"Error: Missing columns in data: {missing_user}")
+            sys.exit(1)
+
+    svids = parse_svid(args.svid)
+    if svids:
+        df = df[df["SVID"].isin(svids)]
+
+    if args.elev_min is not None:
+        df = df[df["Elevation"] >= args.elev_min]
+    if args.elev_max is not None:
+        df = df[df["Elevation"] <= args.elev_max]
+
+    if df.empty:
+        print("Warning: Dataframe is empty after filtering.")
+    
+    return df
+
+def get_segments(df, gap_threshold):
+    """
+    Identifies continuous segments based on TOW gaps and LockTime resets.
+    Returns a list of dataframes, each representing a continuous segment.
+    """
+    if df.empty:
+        return []
+
+    df = df.sort_values(by=["SVID", "TOW"]).copy()
+    segments = []
+    
+    for svid in df["SVID"].unique():
+        sv_df = df[df["SVID"] == svid].copy()
+        tow_gap = sv_df["TOW"].diff() > gap_threshold
+        
+        lock_cols = [c for c in sv_df.columns if "LockTime" in c]
+        lock_reset = pd.Series(False, index=sv_df.index)
+        for col in lock_cols:
+             lock_reset |= (sv_df[col].diff() < 0)
+
+        discontinuity = tow_gap | lock_reset
+        sv_df["segment_id"] = discontinuity.cumsum()
+        
+        for _, segment in sv_df.groupby("segment_id"):
+            segments.append(segment)
+            
+    return segments
+
+def plot_data(segments, x_cols, y_col, output_path=None):
+    """
+    Plots segments with specified markers for discontinuities.
+    x_cols are plotted as subplots, y_col is constant.
+    """
+    if not segments:
+        print("No segments to plot.")
+        return
+
+    if output_path:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+    num_x = len(x_cols)
+    fig, axes = plt.subplots(num_x, 1, figsize=(10, 4 * num_x), sharey=True, constrained_layout=True)
+    
+    if num_x == 1:
+        axes = [axes]
+
+    all_svids = sorted(list(set(seg["SVID"].iloc[0] for seg in segments)))
+    try:
+        color_map = plt.get_cmap("tab20")
+    except AttributeError:
+        color_map = plt.cm.get_cmap("tab20")
+    
+    svid_to_color = {svid: color_map(i % 20) for i, svid in enumerate(all_svids)}
+
+    svid_segments = {}
+    for seg in segments:
+        svid = seg["SVID"].iloc[0]
+        if svid not in svid_segments:
+            svid_segments[svid] = []
+        svid_segments[svid].append(seg)
+
+    for i, x_col in enumerate(x_cols):
+        ax = axes[i]
+        for svid, segs in svid_segments.items():
+            color = svid_to_color[svid]
+            for idx, segment in enumerate(segs):
+                ax.plot(segment[x_col], segment[y_col], color=color, label=f"SVID {svid}" if i == 0 and idx == 0 else "")
+                if idx > 0:
+                    ax.plot(segment[x_col].iloc[0], segment[y_col].iloc[0], marker='o', color=color, markersize=6)
+                if idx < len(segs) - 1:
+                    ax.plot(segment[x_col].iloc[-1], segment[y_col].iloc[-1], marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
+
+        ax.set_xlabel(x_col)
+        ax.set_ylabel(y_col)
+        ax.grid(True)
+        
+        if i == 0:
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
+
+    plt.suptitle(f"ISMR Analysis: {y_col} vs {', '.join(x_cols)}")
+    
+    if output_path:
+        plt.savefig(output_path)
+        print(f"Plot saved to {output_path}")
+    else:
+        plt.show()
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze ISMR CSV data.")
     parser.add_argument("--input", required=True, help="Path to the target ISMR file.")
@@ -34,6 +170,7 @@ def main():
     parser.add_argument("--x-cols", nargs='+', required=True, help="Column names to plot on the x-axis.")
     parser.add_argument("--y-col", required=True, help="Column name to plot on the y-axis.")
     parser.add_argument("--gap-threshold", type=float, default=60.0, help="Threshold for TOW discontinuity in seconds (default: 60).")
+    parser.add_argument("--output", help="Path to save the plot (e.g., 'plot.png'). If not provided, shows the plot.")
 
     args = parser.parse_args()
 
@@ -41,7 +178,24 @@ def main():
         print(f"Error: Input file '{args.input}' not found.")
         sys.exit(1)
 
-    print(f"Starting analysis on {args.input}...")
+    print(f"Loading and filtering data from {args.input}...")
+    df = load_and_filter(args)
+    
+    if df.empty:
+        print("No data to plot.")
+        return
+
+    print("Identifying continuous segments...")
+    segments = get_segments(df, args.gap_threshold)
+    print(f"Found {len(segments)} segments across {len(df['SVID'].unique())} SVIDs.")
+
+    print("Plotting data...")
+    # Using a non-blocking show if possible, but standard is fine for CLI.
+    # Note: In some environments plt.show() might hang or fail if no display is available.
+    try:
+        plot_data(segments, args.x_cols, args.y_col, args.output)
+    except Exception as e:
+        print(f"Error during plotting: {e}")
 
 if __name__ == "__main__":
     main()
