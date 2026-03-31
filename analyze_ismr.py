@@ -1,7 +1,6 @@
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import sys
 import os
 
@@ -57,9 +56,8 @@ def load_and_filter(args):
             print(f"Error: Missing columns in data: {missing_user}")
             sys.exit(1)
 
-    # Normalize TOW to datetime for better plotting if requested
-    # We'll keep the original TOW for filtering and segment logic
-    df['TOW_DT'] = pd.to_datetime(df['TOW'], unit='s', origin=pd.Timestamp('2023-01-01'))
+    # Normalize TOW to fractional hours
+    df['TOW_HOURS'] = df['TOW'] / 3600.0
 
     svids = parse_svid(args.svid)
     if svids:
@@ -107,7 +105,7 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
     """
     Plots segments with specified markers for discontinuities.
     If compress is True, all y_cols are plotted on the same axes for each x_col.
-    TOW is normalized to HH:MM:SS.
+    TOW is normalized to fractional hours.
     """
     if not segments:
         print("No segments to plot.")
@@ -137,7 +135,6 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
     
     svid_to_color = {svid: color_map(i % 20) for i, svid in enumerate(all_svids)}
     
-    # Styles for different Y columns when compressed
     y_styles = ['-', '--', ':', '-.']
 
     svid_segments = {}
@@ -158,7 +155,7 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                 for svid, segs in svid_segments.items():
                     color = svid_to_color[svid]
                     for seg_idx, segment in enumerate(segs):
-                        x_data = segment['TOW_DT'] if x_col == 'TOW' else segment[x_col]
+                        x_data = segment['TOW_HOURS'] if x_col == 'TOW' else segment[x_col]
                         
                         label = f"SVID {svid}"
                         if len(y_group) > 1:
@@ -167,7 +164,6 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                         ax.plot(x_data, segment[y_col], color=color, linestyle=style,
                                 label=label if plot_idx == 0 and seg_idx == 0 else "")
                         
-                        # Discontinuity markers
                         if seg_idx > 0:
                             ax.plot(x_data.iloc[0], segment[y_col].iloc[0], 
                                     marker='o', color=color, markersize=6)
@@ -175,12 +171,9 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                             ax.plot(x_data.iloc[-1], segment[y_col].iloc[-1], 
                                     marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
 
-            ax.set_xlabel(x_col if x_col != 'TOW' else "TOW (HH:MM:SS)")
+            ax.set_xlabel(x_col if x_col != 'TOW' else "TOW (Hours)")
             ax.set_ylabel(", ".join(y_group) if compress else y_group[0])
             ax.grid(True)
-            
-            if x_col == 'TOW':
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
             
             if plot_idx == 0:
                 handles, labels = ax.get_legend_handles_labels()
