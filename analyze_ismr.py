@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import sys
 import os
+import glob
 
 def parse_svid(svid_str):
     """Parses SVID string which can be a single ID, a comma-separated list, or a range."""
@@ -44,7 +45,7 @@ def are_similar(y1, y2):
     return False
 
 def load_and_filter(args):
-    """Loads ISMR data, applies filters, and handles missing columns."""
+    """Loads multiple ISMR files, concatenates those with the same WN, and applies filters."""
     header = [
         "WN", "TOW", "SVID", "RxState", "Azimuth", "Elevation", "Sig1_CN0", "Sig1_S4", "Sig1_S4_corr", 
         "Sig1_Phi01", "Sig1_Phi03", "Sig1_Phi10", "Sig1_Phi30", "Sig1_Phi60", "Sig1_AvgCCD", "Sig1_SigmaCCD", 
@@ -57,11 +58,35 @@ def load_and_filter(args):
         "Sig3_SI", "Sig3_SI_num", "Sig3_p", "Sig1_T", "Sig2_T", "Sig3_T"
     ]
 
-    try:
-        df = pd.read_csv(args.input, names=header, skipinitialspace=True)
-    except Exception as e:
-        print(f"Error reading file: {e}")
+    all_dfs = []
+    # Expand globs if any
+    input_files = []
+    for pattern in args.input:
+        input_files.extend(glob.glob(pattern))
+    
+    if not input_files:
+        print("Error: No input files found matching the provided patterns.")
         sys.exit(1)
+
+    for file_path in input_files:
+        try:
+            temp_df = pd.read_csv(file_path, names=header, skipinitialspace=True)
+            all_dfs.append(temp_df)
+        except Exception as e:
+            print(f"Warning: Error reading file {file_path}: {e}. Skipping.")
+
+    if not all_dfs:
+        print("Error: No data could be loaded.")
+        sys.exit(1)
+
+    df = pd.concat(all_dfs, ignore_index=True)
+    
+    # Check WN consistency
+    wns = df['WN'].unique()
+    if len(wns) > 1:
+        print(f"Note: Multiple Week Numbers (WNs) detected: {wns}. Concatenating all.")
+
+    df = df.sort_values(by=["WN", "TOW"]).drop_duplicates()
 
     required_cols = ["TOW", "SVID", "Elevation"] + args.x_cols + args.y_cols
     lock_time_cols = [c for c in header if "LockTime" in c]
@@ -100,12 +125,13 @@ def get_segments(df, gap_threshold):
     if df.empty:
         return []
 
-    df = df.sort_values(by=["SVID", "TOW"]).copy()
+    df = df.sort_values(by=["SVID", "WN", "TOW"]).copy()
     segments = []
     
     for svid in df["SVID"].unique():
         sv_df = df[df["SVID"] == svid].copy()
-        tow_gap = sv_df["TOW"].diff() > gap_threshold
+        # Discontinuity if WN changes or TOW gap > threshold
+        tow_gap = (sv_df["TOW"].diff() > gap_threshold) | (sv_df["WN"].diff() != 0)
         
         lock_cols = [c for c in sv_df.columns if "LockTime" in c]
         lock_reset = pd.Series(False, index=sv_df.index)
@@ -122,8 +148,8 @@ def get_segments(df, gap_threshold):
 
 def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
     """
-    Plots segments with specified markers for discontinuities.
-    If compress is True and 2 non-similar Ys, uses dual Y axes.
+    Plots segments with discrete points and markers for discontinuities.
+    Day gridlines added for TOW.
     """
     if not segments:
         print("No segments to plot.")
@@ -167,8 +193,6 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
         
         for y_group in target_y_groups:
             ax1 = axes[plot_idx]
-            
-            # Check if we need dual axes
             use_twin = False
             if len(y_group) == 2 and not are_similar(y_group[0], y_group[1]):
                 use_twin = True
@@ -187,19 +211,26 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                         if len(y_group) > 1:
                             label += f" ({y_col})"
                         
+                        # Plot with markers for each data point
                         curr_ax.plot(x_data, segment[y_col], color=color, linestyle=style,
-                                     label=label if plot_idx == 0 and seg_idx == 0 else "")
+                                     marker='.', markersize=3, alpha=0.7,
+                                     label=label if plot_idx == 0 and seg_idx == 0 and y_idx == 0 else "")
                         
-                        # Discontinuity markers
+                        # Discontinuity markers (larger circles)
                         if seg_idx > 0:
                             curr_ax.plot(x_data.iloc[0], segment[y_col].iloc[0], 
-                                         marker='o', color=color, markersize=6)
+                                         marker='o', color=color, markersize=8)
                         if seg_idx < len(segs) - 1:
                             curr_ax.plot(x_data.iloc[-1], segment[y_col].iloc[-1], 
-                                         marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
+                                         marker='o', markerfacecolor='none', markeredgecolor=color, markersize=8)
 
             ax1.set_xlabel(x_col if x_col != 'TOW' else "TOW (Hours)")
-            ax1.grid(True)
+            ax1.grid(True, which='both', linestyle=':', alpha=0.5)
+
+            # Add major gridlines for days if x_col is TOW
+            if x_col == 'TOW':
+                for day_hour in range(0, 169, 24):
+                    ax1.axvline(x=day_hour, color='black', linestyle='-', linewidth=1, alpha=0.3)
 
             if use_twin:
                 ax1.set_ylabel(y_group[0], color='black')
@@ -207,7 +238,6 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
             else:
                 ax1.set_ylabel(", ".join(y_group))
             
-            # Legend handling
             if plot_idx == 0:
                 h1, l1 = ax1.get_legend_handles_labels()
                 if use_twin:
@@ -216,7 +246,7 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                     l1.extend(l2)
                 
                 by_label = dict(zip(l1, h1))
-                ax1.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
+                ax1.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='x-small')
             
             plot_idx += 1
 
@@ -230,7 +260,7 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze ISMR CSV data.")
-    parser.add_argument("--input", required=True, help="Path to the target ISMR file.")
+    parser.add_argument("--input", nargs='+', required=True, help="Path to the target ISMR file(s) or glob pattern.")
     parser.add_argument("--svid", help="SVID(s) to filter (e.g., '15', '1,5,12', or '10-20').")
     parser.add_argument("--elev-min", type=float, help="Minimum elevation filter.")
     parser.add_argument("--elev-max", type=float, help="Maximum elevation filter.")
@@ -246,11 +276,7 @@ def main():
         print("Error: --y-cols is capped to a maximum of 2 parameters.")
         sys.exit(1)
 
-    if not os.path.exists(args.input):
-        print(f"Error: Input file '{args.input}' not found.")
-        sys.exit(1)
-
-    print(f"Loading and filtering data from {args.input}...")
+    print(f"Loading and filtering data from {len(args.input)} input patterns...")
     df = load_and_filter(args)
     
     if df.empty:
