@@ -24,6 +24,25 @@ def parse_svid(svid_str):
                 print(f"Warning: Invalid SVID format '{part}'. Skipping.")
     return list(svids)
 
+def are_similar(y1, y2):
+    """Determines if two parameters are similar enough to share a Y-axis scale."""
+    groups = [
+        ["S4", "S4_corr"],
+        ["Phi01", "Phi03", "Phi10", "Phi30", "Phi60"],
+        ["TEC", "dTEC"],
+        ["CN0"],
+        ["LockTime"],
+        ["SI"],
+        ["AvgCCD", "SigmaCCD"],
+        ["Azimuth", "Elevation", "T"]
+    ]
+    for group in groups:
+        match1 = any(g in y1 for g in group)
+        match2 = any(g in y2 for g in group)
+        if match1 and match2:
+            return True
+    return False
+
 def load_and_filter(args):
     """Loads ISMR data, applies filters, and handles missing columns."""
     header = [
@@ -104,8 +123,7 @@ def get_segments(df, gap_threshold):
 def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
     """
     Plots segments with specified markers for discontinuities.
-    If compress is True, all y_cols are plotted on the same axes for each x_col.
-    TOW is normalized to fractional hours.
+    If compress is True and 2 non-similar Ys, uses dual Y axes.
     """
     if not segments:
         print("No segments to plot.")
@@ -134,8 +152,7 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
         color_map = plt.cm.get_cmap("tab20")
     
     svid_to_color = {svid: color_map(i % 20) for i, svid in enumerate(all_svids)}
-    
-    y_styles = ['-', '--', ':', '-.']
+    y_styles = ['-', '--']
 
     svid_segments = {}
     for seg in segments:
@@ -149,9 +166,18 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
         target_y_groups = [y_cols] if compress else [[y] for y in y_cols]
         
         for y_group in target_y_groups:
-            ax = axes[plot_idx]
+            ax1 = axes[plot_idx]
+            
+            # Check if we need dual axes
+            use_twin = False
+            if len(y_group) == 2 and not are_similar(y_group[0], y_group[1]):
+                use_twin = True
+                ax2 = ax1.twinx()
+            
             for y_idx, y_col in enumerate(y_group):
-                style = y_styles[y_idx % len(y_styles)]
+                curr_ax = ax1 if (y_idx == 0 or not use_twin) else ax2
+                style = y_styles[y_idx % 2]
+                
                 for svid, segs in svid_segments.items():
                     color = svid_to_color[svid]
                     for seg_idx, segment in enumerate(segs):
@@ -161,24 +187,36 @@ def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
                         if len(y_group) > 1:
                             label += f" ({y_col})"
                         
-                        ax.plot(x_data, segment[y_col], color=color, linestyle=style,
-                                label=label if plot_idx == 0 and seg_idx == 0 else "")
+                        curr_ax.plot(x_data, segment[y_col], color=color, linestyle=style,
+                                     label=label if plot_idx == 0 and seg_idx == 0 else "")
                         
+                        # Discontinuity markers
                         if seg_idx > 0:
-                            ax.plot(x_data.iloc[0], segment[y_col].iloc[0], 
-                                    marker='o', color=color, markersize=6)
+                            curr_ax.plot(x_data.iloc[0], segment[y_col].iloc[0], 
+                                         marker='o', color=color, markersize=6)
                         if seg_idx < len(segs) - 1:
-                            ax.plot(x_data.iloc[-1], segment[y_col].iloc[-1], 
-                                    marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
+                            curr_ax.plot(x_data.iloc[-1], segment[y_col].iloc[-1], 
+                                         marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
 
-            ax.set_xlabel(x_col if x_col != 'TOW' else "TOW (Hours)")
-            ax.set_ylabel(", ".join(y_group) if compress else y_group[0])
-            ax.grid(True)
+            ax1.set_xlabel(x_col if x_col != 'TOW' else "TOW (Hours)")
+            ax1.grid(True)
+
+            if use_twin:
+                ax1.set_ylabel(y_group[0], color='black')
+                ax2.set_ylabel(y_group[1], color='black')
+            else:
+                ax1.set_ylabel(", ".join(y_group))
             
+            # Legend handling
             if plot_idx == 0:
-                handles, labels = ax.get_legend_handles_labels()
-                by_label = dict(zip(labels, handles))
-                ax.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
+                h1, l1 = ax1.get_legend_handles_labels()
+                if use_twin:
+                    h2, l2 = ax2.get_legend_handles_labels()
+                    h1.extend(h2)
+                    l1.extend(l2)
+                
+                by_label = dict(zip(l1, h1))
+                ax1.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
             
             plot_idx += 1
 
@@ -203,6 +241,10 @@ def main():
     parser.add_argument("--compress", action="store_true", help="Plot all Y columns on a single plot per X column.")
 
     args = parser.parse_args()
+
+    if len(args.y_cols) > 2:
+        print("Error: --y-cols is capped to a maximum of 2 parameters.")
+        sys.exit(1)
 
     if not os.path.exists(args.input):
         print(f"Error: Input file '{args.input}' not found.")
