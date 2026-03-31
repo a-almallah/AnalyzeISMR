@@ -1,6 +1,7 @@
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import sys
 import os
 
@@ -56,6 +57,10 @@ def load_and_filter(args):
             print(f"Error: Missing columns in data: {missing_user}")
             sys.exit(1)
 
+    # Normalize TOW to datetime for better plotting if requested
+    # We'll keep the original TOW for filtering and segment logic
+    df['TOW_DT'] = pd.to_datetime(df['TOW'], unit='s', origin=pd.Timestamp('2023-01-01'))
+
     svids = parse_svid(args.svid)
     if svids:
         df = df[df["SVID"].isin(svids)]
@@ -98,10 +103,11 @@ def get_segments(df, gap_threshold):
             
     return segments
 
-def plot_data(segments, x_cols, y_cols, output_path=None):
+def plot_data(segments, x_cols, y_cols, output_path=None, compress=False):
     """
     Plots segments with specified markers for discontinuities.
-    Generates subplots for each combination of x_cols and y_cols.
+    If compress is True, all y_cols are plotted on the same axes for each x_col.
+    TOW is normalized to HH:MM:SS.
     """
     if not segments:
         print("No segments to plot.")
@@ -112,15 +118,13 @@ def plot_data(segments, x_cols, y_cols, output_path=None):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-    # Generate pairs of (x, y) to plot
-    plot_pairs = [(x, y) for x in x_cols for y in y_cols]
-    num_plots = len(plot_pairs)
+    if compress:
+        num_plots = len(x_cols)
+    else:
+        num_plots = len(x_cols) * len(y_cols)
     
-    # Share X axis if we are plotting multiple Ys against a single X
-    share_x = len(x_cols) == 1
-    
-    fig, axes = plt.subplots(num_plots, 1, figsize=(12, 5 * num_plots), 
-                             sharex=share_x, constrained_layout=True)
+    fig, axes = plt.subplots(num_plots, 1, figsize=(14, 6 * num_plots), 
+                             sharex=(len(x_cols) == 1), constrained_layout=True)
     
     if num_plots == 1:
         axes = [axes]
@@ -132,6 +136,9 @@ def plot_data(segments, x_cols, y_cols, output_path=None):
         color_map = plt.cm.get_cmap("tab20")
     
     svid_to_color = {svid: color_map(i % 20) for i, svid in enumerate(all_svids)}
+    
+    # Styles for different Y columns when compressed
+    y_styles = ['-', '--', ':', '-.']
 
     svid_segments = {}
     for seg in segments:
@@ -140,28 +147,47 @@ def plot_data(segments, x_cols, y_cols, output_path=None):
             svid_segments[svid] = []
         svid_segments[svid].append(seg)
 
-    for i, (x_col, y_col) in enumerate(plot_pairs):
-        ax = axes[i]
-        for svid, segs in svid_segments.items():
-            color = svid_to_color[svid]
-            for idx, segment in enumerate(segs):
-                ax.plot(segment[x_col], segment[y_col], color=color, 
-                        label=f"SVID {svid}" if i == 0 and idx == 0 else "")
-                if idx > 0:
-                    ax.plot(segment[x_col].iloc[0], segment[y_col].iloc[0], 
-                            marker='o', color=color, markersize=6)
-                if idx < len(segs) - 1:
-                    ax.plot(segment[x_col].iloc[-1], segment[y_col].iloc[-1], 
-                            marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
-
-        ax.set_xlabel(x_col)
-        ax.set_ylabel(y_col)
-        ax.grid(True)
+    plot_idx = 0
+    for x_col in x_cols:
+        target_y_groups = [y_cols] if compress else [[y] for y in y_cols]
         
-        if i == 0:
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
+        for y_group in target_y_groups:
+            ax = axes[plot_idx]
+            for y_idx, y_col in enumerate(y_group):
+                style = y_styles[y_idx % len(y_styles)]
+                for svid, segs in svid_segments.items():
+                    color = svid_to_color[svid]
+                    for seg_idx, segment in enumerate(segs):
+                        x_data = segment['TOW_DT'] if x_col == 'TOW' else segment[x_col]
+                        
+                        label = f"SVID {svid}"
+                        if len(y_group) > 1:
+                            label += f" ({y_col})"
+                        
+                        ax.plot(x_data, segment[y_col], color=color, linestyle=style,
+                                label=label if plot_idx == 0 and seg_idx == 0 else "")
+                        
+                        # Discontinuity markers
+                        if seg_idx > 0:
+                            ax.plot(x_data.iloc[0], segment[y_col].iloc[0], 
+                                    marker='o', color=color, markersize=6)
+                        if seg_idx < len(segs) - 1:
+                            ax.plot(x_data.iloc[-1], segment[y_col].iloc[-1], 
+                                    marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
+
+            ax.set_xlabel(x_col if x_col != 'TOW' else "TOW (HH:MM:SS)")
+            ax.set_ylabel(", ".join(y_group) if compress else y_group[0])
+            ax.grid(True)
+            
+            if x_col == 'TOW':
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            
+            if plot_idx == 0:
+                handles, labels = ax.get_legend_handles_labels()
+                by_label = dict(zip(labels, handles))
+                ax.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
+            
+            plot_idx += 1
 
     plt.suptitle(f"ISMR Analysis: {', '.join(y_cols)} vs {', '.join(x_cols)}")
     
@@ -181,6 +207,7 @@ def main():
     parser.add_argument("--y-cols", nargs='+', required=True, help="Column names to plot on the y-axis.")
     parser.add_argument("--gap-threshold", type=float, default=60.0, help="Threshold for TOW discontinuity in seconds (default: 60).")
     parser.add_argument("--output", help="Path to save the plot (e.g., 'plot.png'). If not provided, shows the plot.")
+    parser.add_argument("--compress", action="store_true", help="Plot all Y columns on a single plot per X column.")
 
     args = parser.parse_args()
 
@@ -201,9 +228,11 @@ def main():
 
     print("Plotting data...")
     try:
-        plot_data(segments, args.x_cols, args.y_cols, args.output)
+        plot_data(segments, args.x_cols, args.y_cols, args.output, args.compress)
     except Exception as e:
         print(f"Error during plotting: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
