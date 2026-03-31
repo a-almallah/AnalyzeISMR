@@ -44,13 +44,13 @@ def load_and_filter(args):
         print(f"Error reading file: {e}")
         sys.exit(1)
 
-    required_cols = ["TOW", "SVID", "Elevation", args.y_col] + args.x_cols
+    required_cols = ["TOW", "SVID", "Elevation"] + args.x_cols + args.y_cols
     lock_time_cols = [c for c in header if "LockTime" in c]
     required_cols.extend(lock_time_cols)
 
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        user_specified = set(args.x_cols + [args.y_col, "TOW", "SVID", "Elevation"])
+        user_specified = set(args.x_cols + args.y_cols + ["TOW", "SVID", "Elevation"])
         missing_user = [c for c in missing if c in user_specified]
         if missing_user:
             print(f"Error: Missing columns in data: {missing_user}")
@@ -98,10 +98,10 @@ def get_segments(df, gap_threshold):
             
     return segments
 
-def plot_data(segments, x_cols, y_col, output_path=None):
+def plot_data(segments, x_cols, y_cols, output_path=None):
     """
     Plots segments with specified markers for discontinuities.
-    x_cols are plotted as subplots, y_col is constant.
+    Generates subplots for each combination of x_cols and y_cols.
     """
     if not segments:
         print("No segments to plot.")
@@ -112,10 +112,17 @@ def plot_data(segments, x_cols, y_col, output_path=None):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-    num_x = len(x_cols)
-    fig, axes = plt.subplots(num_x, 1, figsize=(10, 4 * num_x), sharey=True, constrained_layout=True)
+    # Generate pairs of (x, y) to plot
+    plot_pairs = [(x, y) for x in x_cols for y in y_cols]
+    num_plots = len(plot_pairs)
     
-    if num_x == 1:
+    # Share X axis if we are plotting multiple Ys against a single X
+    share_x = len(x_cols) == 1
+    
+    fig, axes = plt.subplots(num_plots, 1, figsize=(12, 5 * num_plots), 
+                             sharex=share_x, constrained_layout=True)
+    
+    if num_plots == 1:
         axes = [axes]
 
     all_svids = sorted(list(set(seg["SVID"].iloc[0] for seg in segments)))
@@ -133,16 +140,19 @@ def plot_data(segments, x_cols, y_col, output_path=None):
             svid_segments[svid] = []
         svid_segments[svid].append(seg)
 
-    for i, x_col in enumerate(x_cols):
+    for i, (x_col, y_col) in enumerate(plot_pairs):
         ax = axes[i]
         for svid, segs in svid_segments.items():
             color = svid_to_color[svid]
             for idx, segment in enumerate(segs):
-                ax.plot(segment[x_col], segment[y_col], color=color, label=f"SVID {svid}" if i == 0 and idx == 0 else "")
+                ax.plot(segment[x_col], segment[y_col], color=color, 
+                        label=f"SVID {svid}" if i == 0 and idx == 0 else "")
                 if idx > 0:
-                    ax.plot(segment[x_col].iloc[0], segment[y_col].iloc[0], marker='o', color=color, markersize=6)
+                    ax.plot(segment[x_col].iloc[0], segment[y_col].iloc[0], 
+                            marker='o', color=color, markersize=6)
                 if idx < len(segs) - 1:
-                    ax.plot(segment[x_col].iloc[-1], segment[y_col].iloc[-1], marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
+                    ax.plot(segment[x_col].iloc[-1], segment[y_col].iloc[-1], 
+                            marker='o', markerfacecolor='none', markeredgecolor=color, markersize=6)
 
         ax.set_xlabel(x_col)
         ax.set_ylabel(y_col)
@@ -153,7 +163,7 @@ def plot_data(segments, x_cols, y_col, output_path=None):
             by_label = dict(zip(labels, handles))
             ax.legend(by_label.values(), by_label.keys(), loc='upper right', ncol=3, fontsize='small')
 
-    plt.suptitle(f"ISMR Analysis: {y_col} vs {', '.join(x_cols)}")
+    plt.suptitle(f"ISMR Analysis: {', '.join(y_cols)} vs {', '.join(x_cols)}")
     
     if output_path:
         plt.savefig(output_path)
@@ -168,7 +178,7 @@ def main():
     parser.add_argument("--elev-min", type=float, help="Minimum elevation filter.")
     parser.add_argument("--elev-max", type=float, help="Maximum elevation filter.")
     parser.add_argument("--x-cols", nargs='+', required=True, help="Column names to plot on the x-axis.")
-    parser.add_argument("--y-col", required=True, help="Column name to plot on the y-axis.")
+    parser.add_argument("--y-cols", nargs='+', required=True, help="Column names to plot on the y-axis.")
     parser.add_argument("--gap-threshold", type=float, default=60.0, help="Threshold for TOW discontinuity in seconds (default: 60).")
     parser.add_argument("--output", help="Path to save the plot (e.g., 'plot.png'). If not provided, shows the plot.")
 
@@ -190,10 +200,8 @@ def main():
     print(f"Found {len(segments)} segments across {len(df['SVID'].unique())} SVIDs.")
 
     print("Plotting data...")
-    # Using a non-blocking show if possible, but standard is fine for CLI.
-    # Note: In some environments plt.show() might hang or fail if no display is available.
     try:
-        plot_data(segments, args.x_cols, args.y_col, args.output)
+        plot_data(segments, args.x_cols, args.y_cols, args.output)
     except Exception as e:
         print(f"Error during plotting: {e}")
 
